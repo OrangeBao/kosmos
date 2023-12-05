@@ -174,6 +174,10 @@ func (c *ClusterController) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, nil
 	}
 
+	// TODO: @byh k8s  or openApi
+	// if openApi launch special node and pod controller
+	// else ...
+
 	// build mgr for cluster
 	// TODO bug, the v4 log is lost
 	mgr, err := controllerruntime.NewManager(config, controllerruntime.Options{
