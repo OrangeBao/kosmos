@@ -36,8 +36,9 @@ import (
 	"github.com/kosmos.io/kosmos/pkg/apis/kosmos/v1alpha1"
 	"github.com/kosmos.io/kosmos/pkg/generated/clientset/versioned"
 	"github.com/kosmos.io/kosmos/pkg/kubenest/constants"
-	env "github.com/kosmos.io/kosmos/pkg/kubenest/controller/virtualcluster.node.controller/env"
-	"github.com/kosmos.io/kosmos/pkg/kubenest/controller/virtualcluster.node.controller/exector"
+	vcnodecontroller "github.com/kosmos.io/kosmos/pkg/kubenest/controller/virtualcluster.node.manager"
+	env "github.com/kosmos.io/kosmos/pkg/kubenest/controller/virtualcluster.node.manager/env"
+	"github.com/kosmos.io/kosmos/pkg/kubenest/controller/virtualcluster.node.manager/exector"
 	"github.com/kosmos.io/kosmos/pkg/kubenest/tasks"
 	"github.com/kosmos.io/kosmos/pkg/kubenest/util"
 	apiclient "github.com/kosmos.io/kosmos/pkg/kubenest/util/api-client"
@@ -54,6 +55,7 @@ type VirtualClusterInitController struct {
 	KubeNestOptions *v1alpha1.KubeNestConfiguration
 	// CoreNamespaces is the namespaces of kubenest's core resources in vc cluster
 	CoreNamespaces []string
+	nodeManager    *vcnodecontroller.NodeManager
 }
 
 type NodePool struct {
@@ -84,6 +86,27 @@ var nameMap = map[string]int{
 	"adminport":  4,
 }
 
+func NewInitController(
+	client client.Client,
+	config *rest.Config,
+	eventRecorder record.EventRecorder,
+	rootClientSet kubernetes.Interface,
+	kosmosClient versioned.Interface,
+	kubeNestOptions *v1alpha1.KubeNestConfiguration,
+	coreNamespaces []string,
+) *VirtualClusterInitController {
+	return &VirtualClusterInitController{
+		Client:          client,
+		Config:          config,
+		EventRecorder:   eventRecorder,
+		RootClientSet:   rootClientSet,
+		KosmosClient:    kosmosClient,
+		KubeNestOptions: kubeNestOptions,
+		CoreNamespaces:  coreNamespaces,
+		nodeManager:     vcnodecontroller.NewNodeManager(client, rootClientSet, kubeNestOptions),
+	}
+}
+
 func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	startTime := time.Now()
 	klog.V(4).InfoS("Started syncing virtual cluster", "virtual cluster", request, "startTime", startTime)
@@ -104,27 +127,35 @@ func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request re
 
 	//The object is being deleted
 	if !originalCluster.DeletionTimestamp.IsZero() {
-		if len(updatedCluster.Spec.PromoteResources.NodeInfos) > 0 {
-			updatedCluster.Spec.PromoteResources.NodeInfos = nil
-			updatedCluster.Status.Phase = v1alpha1.Deleting
+		updatedCluster.Status.Phase = v1alpha1.Deleting
+		err := c.Update(updatedCluster)
+		if err != nil {
+			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+		}
+
+		if err = c.nodeManager.NodeDelete(ctx, *updatedCluster); err != nil {
+			updatedCluster.Status.Phase = v1alpha1.Pending
+			updatedCluster.Status.Reason = err.Error()
 			err := c.Update(updatedCluster)
 			if err != nil {
 				klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
 				return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
 			}
-			return reconcile.Result{}, nil
+			return reconcile.Result{}, err
 		}
 
-		if updatedCluster.Status.Phase == v1alpha1.AllNodeDeleted {
-			err := c.destroyVirtualCluster(updatedCluster)
-			if err != nil {
-				klog.Errorf("Destroy virtual cluter %s failed. err: %s", updatedCluster.Name, err.Error())
-				return reconcile.Result{}, errors.Wrapf(err, "Destroy virtual cluter %s failed. err: %s", updatedCluster.Name, err.Error())
-			}
-			return c.removeFinalizer(updatedCluster)
-		} else if updatedCluster.Status.Phase == v1alpha1.Deleting {
-			klog.V(2).InfoS("Virtual Cluster is deleting, wait for event 'AllNodeDeleted'", "Virtual Cluster", request)
-			return reconcile.Result{}, nil
+		updatedCluster.Status.Phase = v1alpha1.AllNodeDeleted
+		err = c.Update(updatedCluster)
+		if err != nil {
+			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+		}
+
+		err = c.destroyVirtualCluster(updatedCluster)
+		if err != nil {
+			klog.Errorf("Destroy virtual cluter %s failed. err: %s", updatedCluster.Name, err.Error())
+			return reconcile.Result{}, errors.Wrapf(err, "Destroy virtual cluter %s failed. err: %s", updatedCluster.Name, err.Error())
 		}
 		return c.removeFinalizer(updatedCluster)
 	}
@@ -157,37 +188,19 @@ func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request re
 			klog.Errorf("Error update virtualcluster %s status to %s. %v", updatedCluster.Name, updatedCluster.Status.Phase, err)
 			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
 		}
-	case v1alpha1.AllNodeReady:
-		name, namespace := request.Name, request.Namespace
-		// check if the vc enable vip
-		if len(originalCluster.Status.VipMap) > 0 {
-			// label node for keepalived
-			vcClient, err := tasks.GetVcClientset(c.RootClientSet, name, namespace)
-			if err != nil {
-				klog.Errorf("Get vc client failed. err: %s", err.Error())
-				return reconcile.Result{}, errors.Wrapf(err, "Get vc client failed. err: %s", err.Error())
-			}
-			reps, err := c.labelNode(vcClient)
-			if err != nil {
-				klog.Errorf("Label node for keepalived failed. err: %s", err.Error())
-				return reconcile.Result{}, errors.Wrapf(err, "Label node for keepalived failed. err: %s", err.Error())
-			}
-			klog.V(2).Infof("Label %d node for keepalived", reps)
-		}
-
-		err := c.ensureCorePodsRunning(updatedCluster, constants.WaitCorePodsRunningTimeout)
-		if err != nil {
-			klog.Errorf("Check all pods running err: %s", err.Error())
-			updatedCluster.Status.Reason = err.Error()
+		if err = c.nodeManager.NodeUpdate(ctx, *updatedCluster); err != nil {
 			updatedCluster.Status.Phase = v1alpha1.Pending
-		} else {
-			updatedCluster.Status.Phase = v1alpha1.Completed
+			updatedCluster.Status.Reason = err.Error()
+			err := c.Update(updatedCluster)
+			if err != nil {
+				klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+				return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+			}
+			return reconcile.Result{}, err
 		}
-		err = c.Update(updatedCluster)
-		if err != nil {
-			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
-			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
-		}
+		name, namespace := request.Name, request.Namespace
+		return reconcile.Result{}, c.DoAllNodeReadyCheck(name, namespace, originalCluster, updatedCluster)
+
 	case v1alpha1.Completed:
 		//update request, check if promotepolicy nodes increase or decrease.
 		// only 2 scenarios matched update request with status 'completed'.
@@ -210,11 +223,56 @@ func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request re
 			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
 			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
 		}
+		if err = c.nodeManager.NodeUpdate(ctx, *updatedCluster); err != nil {
+			updatedCluster.Status.Phase = v1alpha1.Pending
+			updatedCluster.Status.Reason = err.Error()
+			err := c.Update(updatedCluster)
+			if err != nil {
+				klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+				return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+			}
+			return reconcile.Result{}, err
+		}
+		name, namespace := request.Name, request.Namespace
+		return reconcile.Result{}, c.DoAllNodeReadyCheck(name, namespace, originalCluster, updatedCluster)
 
 	default:
 		klog.Warningf("Skip virtualcluster %s reconcile status: %s", originalCluster.Name, originalCluster.Status.Phase)
 	}
 	return c.ensureFinalizer(updatedCluster)
+}
+
+func (c *VirtualClusterInitController) DoAllNodeReadyCheck(name, namespace string, originalCluster, updatedCluster *v1alpha1.VirtualCluster) error {
+	// check if the vc enable vip
+	if len(originalCluster.Status.VipMap) > 0 {
+		// label node for keepalived
+		vcClient, err := tasks.GetVcClientset(c.RootClientSet, name, namespace)
+		if err != nil {
+			klog.Errorf("Get vc client failed. err: %s", err.Error())
+			return errors.Wrapf(err, "Get vc client failed. err: %s", err.Error())
+		}
+		reps, err := c.labelNode(vcClient)
+		if err != nil {
+			klog.Errorf("Label node for keepalived failed. err: %s", err.Error())
+			return errors.Wrapf(err, "Label node for keepalived failed. err: %s", err.Error())
+		}
+		klog.V(2).Infof("Label %d node for keepalived", reps)
+	}
+
+	err := c.ensureCorePodsRunning(updatedCluster, constants.WaitCorePodsRunningTimeout)
+	if err != nil {
+		klog.Errorf("Check all pods running err: %s", err.Error())
+		updatedCluster.Status.Reason = err.Error()
+		updatedCluster.Status.Phase = v1alpha1.Pending
+	} else {
+		updatedCluster.Status.Phase = v1alpha1.Completed
+	}
+	err = c.Update(updatedCluster)
+	if err != nil {
+		klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+		return errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+	}
+	return nil
 }
 
 func (c *VirtualClusterInitController) SetupWithManager(mgr manager.Manager) error {
