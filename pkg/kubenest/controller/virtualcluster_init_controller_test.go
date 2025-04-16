@@ -28,12 +28,12 @@ func TestNetxFunc(_ *testing.T) {
 
 func TestCreateApiAnpServer(t *testing.T) {
 	var name, namespace string
-	apiAnpAgentSvc := createAPIAnpAgentSvc(name, namespace, nameMap)
+	ports := make([]int32, 5)
+	apiAnpAgentSvc := createAPIAnpAgentSvc(name, namespace, nameMap, ports)
 
 	if len(apiAnpAgentSvc.Spec.Ports) != 4 {
 		t.Fatalf("apiAnpAgentSvc.Spec.Ports len != 4")
 	}
-	ports := make([]int32, 5)
 	for _, port := range apiAnpAgentSvc.Spec.Ports {
 		v, ok := nameMap[port.Name]
 		if ok {

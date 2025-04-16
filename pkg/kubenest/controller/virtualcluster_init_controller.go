@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -128,22 +130,36 @@ func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request re
 	//The object is being deleted
 	if !originalCluster.DeletionTimestamp.IsZero() {
 		updatedCluster.Status.Phase = v1alpha1.Deleting
+		updatedCluster.Spec.PromoteResources.NodeInfos = nil
 		err := c.Update(updatedCluster)
 		if err != nil {
 			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
 			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
 		}
 
-		if err = c.nodeManager.NodeDelete(ctx, *updatedCluster); err != nil {
+		if err = c.nodeManager.NodeUpdate(ctx, *updatedCluster); err != nil {
 			updatedCluster.Status.Phase = v1alpha1.Pending
 			updatedCluster.Status.Reason = err.Error()
 			err := c.Update(updatedCluster)
 			if err != nil {
-				klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
-				return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+				klog.Errorf("Error delete virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+				return reconcile.Result{}, errors.Wrapf(err, "Error delete virtualcluster %s status", updatedCluster.Name)
 			}
 			return reconcile.Result{}, err
 		}
+
+		// if err = c.nodeManager.NodeDelete(ctx, *updatedCluster); err != nil {
+		// 	updatedCluster.Status.Phase = v1alpha1.Pending
+		// 	updatedCluster.Status.Reason = err.Error()
+		// 	err := c.Update(updatedCluster)
+		// 	if err != nil {
+		// 		klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+		// 		return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+		// 	}
+		// 	return reconcile.Result{}, err
+		// }
+
+		klog.V(2).Infof(" all node is deleted, vc: %s", updatedCluster.Name)
 
 		updatedCluster.Status.Phase = v1alpha1.AllNodeDeleted
 		err = c.Update(updatedCluster)
@@ -312,18 +328,21 @@ func (c *VirtualClusterInitController) ensureFinalizer(virtualCluster *v1alpha1.
 	if controllerutil.ContainsFinalizer(virtualCluster, VirtualClusterControllerFinalizer) {
 		return reconcile.Result{}, nil
 	}
-	current := &v1alpha1.VirtualCluster{}
-	if err := c.Client.Get(context.TODO(), types.NamespacedName{
-		Namespace: virtualCluster.Namespace,
-		Name:      virtualCluster.Name,
-	}, current); err != nil {
-		klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
-		return reconcile.Result{Requeue: true}, err
-	}
 
-	updated := current.DeepCopy()
-	controllerutil.AddFinalizer(updated, VirtualClusterControllerFinalizer)
-	err := c.Client.Update(context.TODO(), updated)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.VirtualCluster{}
+		if err := c.Client.Get(context.TODO(), types.NamespacedName{
+			Namespace: virtualCluster.Namespace,
+			Name:      virtualCluster.Name,
+		}, current); err != nil {
+			klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
+			return err
+		}
+		updated := current.DeepCopy()
+		controllerutil.AddFinalizer(updated, VirtualClusterControllerFinalizer)
+		return c.Client.Update(context.TODO(), updated)
+	})
+
 	if err != nil {
 		klog.Errorf("update virtualcluster %s error. %v", virtualCluster.Name, err)
 		klog.Errorf("Failed to add finalizer to VirtualCluster %s/%s: %v", virtualCluster.Namespace, virtualCluster.Name, err)
@@ -338,18 +357,20 @@ func (c *VirtualClusterInitController) removeFinalizer(virtualCluster *v1alpha1.
 		return reconcile.Result{}, nil
 	}
 
-	current := &v1alpha1.VirtualCluster{}
-	if err := c.Client.Get(context.TODO(), types.NamespacedName{
-		Namespace: virtualCluster.Namespace,
-		Name:      virtualCluster.Name,
-	}, current); err != nil {
-		klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
-		return reconcile.Result{Requeue: true}, err
-	}
-	updated := current.DeepCopy()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.VirtualCluster{}
+		if err := c.Client.Get(context.TODO(), types.NamespacedName{
+			Namespace: virtualCluster.Namespace,
+			Name:      virtualCluster.Name,
+		}, current); err != nil {
+			klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
+			return err
+		}
+		updated := current.DeepCopy()
 
-	controllerutil.RemoveFinalizer(updated, VirtualClusterControllerFinalizer)
-	err := c.Client.Update(context.TODO(), updated)
+		controllerutil.RemoveFinalizer(updated, VirtualClusterControllerFinalizer)
+		return c.Client.Update(context.TODO(), updated)
+	})
 	if err != nil {
 		klog.Errorf("Failed to remove finalizer to VirtualCluster %s/%s: %v", virtualCluster.Namespace, virtualCluster.Name, err)
 		return reconcile.Result{Requeue: true}, err
@@ -874,7 +895,7 @@ func (c *VirtualClusterInitController) GetHostPortNextFunc(_ *v1alpha1.VirtualCl
 	return next, nil
 }
 
-func createAPIAnpAgentSvc(name, namespace string, nameMap map[string]int) *corev1.Service {
+func createAPIAnpAgentSvc(name, namespace string, nameMap map[string]int, ports []int32) *corev1.Service {
 	apiAnpAgentSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      util.GetKonnectivityAPIServerName(name),
@@ -891,7 +912,8 @@ func createAPIAnpAgentSvc(name, namespace string, nameMap map[string]int) *corev
 						TargetPort: intstr.IntOrString{
 							IntVal: 8080 + int32(v),
 						},
-						Name: k,
+						NodePort: ports[v],
+						Name:     k,
 					})
 				}
 				return ret
@@ -901,8 +923,104 @@ func createAPIAnpAgentSvc(name, namespace string, nameMap map[string]int) *corev
 	return apiAnpAgentSvc
 }
 
-func (c *VirtualClusterInitController) GetNodePorts(client kubernetes.Interface, virtualCluster *v1alpha1.VirtualCluster) ([]int32, error) {
+func getPortRange() (int, int) {
+	vcnodeminPortStr := os.Getenv("VC_NODE_MIN_PORT")
+	if len(vcnodeminPortStr) == 0 {
+		vcnodeminPortStr = "30000"
+	}
+	vcnodemaxPortStr := os.Getenv("VC_NODE_MAX_PORT")
+	if len(vcnodemaxPortStr) == 0 {
+		vcnodemaxPortStr = "32767"
+	}
+	minPort, err := strconv.Atoi(vcnodeminPortStr)
+	if err != nil {
+		klog.Fatal(err)
+	}
+
+	maxPort, err := strconv.Atoi(vcnodemaxPortStr)
+	if err != nil {
+		klog.Fatal(err)
+	}
+
+	return minPort, maxPort
+}
+
+func getRandomAvailablePort(excludedPorts map[int32]bool) (int32, error) {
+	minPort, maxPort := getPortRange()
+
+	// generate ports exclude the excluded ports
+	availablePorts := []int32{}
+	for p := int32(minPort); p <= int32(maxPort); p++ {
+		if !excludedPorts[p] {
+			availablePorts = append(availablePorts, p)
+		}
+	}
+
+	if len(availablePorts) == 0 {
+		klog.Errorf("No available ports found.")
+		return 0, fmt.Errorf("no available ports found. %v", excludedPorts)
+	}
+
+	i, err := util.SecureRandomInt(len(availablePorts))
+	if err != nil {
+		return 0, err
+	}
+	return availablePorts[i], nil
+}
+
+func (c *VirtualClusterInitController) SelectNodePorts() ([]int32, error) {
 	ports := make([]int32, 5)
+
+	excludePort := map[int32]bool{}
+
+	vcList := &v1alpha1.VirtualClusterList{}
+	err := c.List(context.Background(), vcList)
+	if err != nil {
+		klog.Errorf("list virtual cluster error: %v", err)
+		return nil, err
+	}
+
+	for _, vc := range vcList.Items {
+		excludePort[vc.Status.Port] = true
+		for _, p := range vc.Status.PortMap {
+			excludePort[p] = true
+		}
+	}
+
+	svcList, err := c.RootClientSet.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("Failed to list services: %v", err)
+		return nil, err
+	}
+
+	for _, svc := range svcList.Items {
+		if svc.Spec.Type == "NodePort" {
+			for _, port := range svc.Spec.Ports {
+				if port.NodePort != 0 {
+					excludePort[port.NodePort] = true
+				}
+			}
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		p, err := getRandomAvailablePort(excludePort)
+		if err != nil {
+			return nil, err
+		}
+		ports[i] = p
+	}
+
+	klog.V(2).Infof("################ Selected ports: %v", ports)
+
+	return ports, nil
+}
+
+func (c *VirtualClusterInitController) GetNodePorts(client kubernetes.Interface, virtualCluster *v1alpha1.VirtualCluster) ([]int32, error) {
+	ports, err := c.SelectNodePorts()
+	if err != nil {
+		return nil, err
+	}
 	ipFamilies := utils.IPFamilyGenerator(constants.APIServerServiceSubnet)
 	name := virtualCluster.GetName()
 	namespace := virtualCluster.GetNamespace()
@@ -920,13 +1038,14 @@ func (c *VirtualClusterInitController) GetNodePorts(client kubernetes.Interface,
 					TargetPort: intstr.IntOrString{
 						IntVal: 8080, // just for get node port
 					},
-					Name: "client",
+					NodePort: ports[0],
+					Name:     "client",
 				},
 			},
 			IPFamilies: ipFamilies,
 		},
 	}
-	err := util.CreateOrUpdateService(client, apiSvc)
+	err = util.CreateOrUpdateService(client, apiSvc)
 	if err != nil {
 		return nil, fmt.Errorf("can not create api svc for allocate port, error: %s", err)
 	}
@@ -938,7 +1057,7 @@ func (c *VirtualClusterInitController) GetNodePorts(client kubernetes.Interface,
 	nodePort := createdAPISvc.Spec.Ports[0].NodePort
 	ports[0] = nodePort
 
-	apiAnpAgentSvc := createAPIAnpAgentSvc(name, namespace, nameMap)
+	apiAnpAgentSvc := createAPIAnpAgentSvc(name, namespace, nameMap, ports)
 	err = util.CreateOrUpdateService(client, apiAnpAgentSvc)
 	if err != nil {
 		return nil, fmt.Errorf("can not create anp svc for allocate port, error: %s", err)
