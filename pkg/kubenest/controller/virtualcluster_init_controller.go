@@ -128,22 +128,36 @@ func (c *VirtualClusterInitController) Reconcile(ctx context.Context, request re
 	//The object is being deleted
 	if !originalCluster.DeletionTimestamp.IsZero() {
 		updatedCluster.Status.Phase = v1alpha1.Deleting
+		updatedCluster.Spec.PromoteResources.NodeInfos = nil
 		err := c.Update(updatedCluster)
 		if err != nil {
 			klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
 			return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
 		}
 
-		if err = c.nodeManager.NodeDelete(ctx, *updatedCluster); err != nil {
+		if err = c.nodeManager.NodeUpdate(ctx, *updatedCluster); err != nil {
 			updatedCluster.Status.Phase = v1alpha1.Pending
 			updatedCluster.Status.Reason = err.Error()
 			err := c.Update(updatedCluster)
 			if err != nil {
-				klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
-				return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+				klog.Errorf("Error delete virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+				return reconcile.Result{}, errors.Wrapf(err, "Error delete virtualcluster %s status", updatedCluster.Name)
 			}
 			return reconcile.Result{}, err
 		}
+
+		// if err = c.nodeManager.NodeDelete(ctx, *updatedCluster); err != nil {
+		// 	updatedCluster.Status.Phase = v1alpha1.Pending
+		// 	updatedCluster.Status.Reason = err.Error()
+		// 	err := c.Update(updatedCluster)
+		// 	if err != nil {
+		// 		klog.Errorf("Error update virtualcluster %s status to %s", updatedCluster.Name, updatedCluster.Status.Phase)
+		// 		return reconcile.Result{}, errors.Wrapf(err, "Error update virtualcluster %s status", updatedCluster.Name)
+		// 	}
+		// 	return reconcile.Result{}, err
+		// }
+
+		klog.V(2).Infof(" all node is deleted, vc: %s", updatedCluster.Name)
 
 		updatedCluster.Status.Phase = v1alpha1.AllNodeDeleted
 		err = c.Update(updatedCluster)
@@ -312,18 +326,21 @@ func (c *VirtualClusterInitController) ensureFinalizer(virtualCluster *v1alpha1.
 	if controllerutil.ContainsFinalizer(virtualCluster, VirtualClusterControllerFinalizer) {
 		return reconcile.Result{}, nil
 	}
-	current := &v1alpha1.VirtualCluster{}
-	if err := c.Client.Get(context.TODO(), types.NamespacedName{
-		Namespace: virtualCluster.Namespace,
-		Name:      virtualCluster.Name,
-	}, current); err != nil {
-		klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
-		return reconcile.Result{Requeue: true}, err
-	}
 
-	updated := current.DeepCopy()
-	controllerutil.AddFinalizer(updated, VirtualClusterControllerFinalizer)
-	err := c.Client.Update(context.TODO(), updated)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.VirtualCluster{}
+		if err := c.Client.Get(context.TODO(), types.NamespacedName{
+			Namespace: virtualCluster.Namespace,
+			Name:      virtualCluster.Name,
+		}, current); err != nil {
+			klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
+			return err
+		}
+		updated := current.DeepCopy()
+		controllerutil.AddFinalizer(updated, VirtualClusterControllerFinalizer)
+		return c.Client.Update(context.TODO(), updated)
+	})
+
 	if err != nil {
 		klog.Errorf("update virtualcluster %s error. %v", virtualCluster.Name, err)
 		klog.Errorf("Failed to add finalizer to VirtualCluster %s/%s: %v", virtualCluster.Namespace, virtualCluster.Name, err)
@@ -338,18 +355,20 @@ func (c *VirtualClusterInitController) removeFinalizer(virtualCluster *v1alpha1.
 		return reconcile.Result{}, nil
 	}
 
-	current := &v1alpha1.VirtualCluster{}
-	if err := c.Client.Get(context.TODO(), types.NamespacedName{
-		Namespace: virtualCluster.Namespace,
-		Name:      virtualCluster.Name,
-	}, current); err != nil {
-		klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
-		return reconcile.Result{Requeue: true}, err
-	}
-	updated := current.DeepCopy()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.VirtualCluster{}
+		if err := c.Client.Get(context.TODO(), types.NamespacedName{
+			Namespace: virtualCluster.Namespace,
+			Name:      virtualCluster.Name,
+		}, current); err != nil {
+			klog.Errorf("get virtualcluster %s error. %v", virtualCluster.Name, err)
+			return err
+		}
+		updated := current.DeepCopy()
 
-	controllerutil.RemoveFinalizer(updated, VirtualClusterControllerFinalizer)
-	err := c.Client.Update(context.TODO(), updated)
+		controllerutil.RemoveFinalizer(updated, VirtualClusterControllerFinalizer)
+		return c.Client.Update(context.TODO(), updated)
+	})
 	if err != nil {
 		klog.Errorf("Failed to remove finalizer to VirtualCluster %s/%s: %v", virtualCluster.Namespace, virtualCluster.Name, err)
 		return reconcile.Result{Requeue: true}, err
@@ -900,7 +919,6 @@ func createAPIAnpAgentSvc(name, namespace string, nameMap map[string]int) *corev
 	}
 	return apiAnpAgentSvc
 }
-
 func (c *VirtualClusterInitController) GetNodePorts(client kubernetes.Interface, virtualCluster *v1alpha1.VirtualCluster) ([]int32, error) {
 	ports := make([]int32, 5)
 	ipFamilies := utils.IPFamilyGenerator(constants.APIServerServiceSubnet)
