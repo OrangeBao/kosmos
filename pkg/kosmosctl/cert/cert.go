@@ -12,5 +12,6 @@ func NewCmdCert() *cobra.Command {
 	}
 
 	cmd.AddCommand(NewCmdRenewCert())
+	cmd.AddCommand(NewCmdNodePortCert())
 	return cmd
 }

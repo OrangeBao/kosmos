@@ -16,20 +16,12 @@ var RenewCertExample = templates.Examples(i18n.T(`
      kosmosctl renew cert --kubeconfig=xxxx  --namespace=xxxx --name=xxxx --agent-user=xxxx --agent-pass=xxxx
 `))
 
-type RenewOptions struct {
-	Namespace      string
-	Name           string
-	KubeconfigPath string
-	NodeAgentOptions
-}
-
-type NodeAgentOptions struct {
-	WebUser string
-	WebPass string
+type CertCmdOptions struct {
+	CertOptions CertOptions
 }
 
 func NewCmdRenewCert() *cobra.Command {
-	o := &RenewOptions{}
+	o := &CertCmdOptions{}
 	cmd := &cobra.Command{
 		Use:                   "cert",
 		Short:                 i18n.T("renew cert for virtual cluster. "),
@@ -46,55 +38,52 @@ func NewCmdRenewCert() *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVarP(&o.Namespace, "namespace", "e", "", "namespace of vc")
-	flags.StringVarP(&o.Name, "name", "n", "", "name of vc")
-	flags.StringVarP(&o.KubeconfigPath, "kubeconfig", "k", "", "kubeconfig path of host cluster")
-	flags.StringVarP(&o.WebUser, "agent-user", "u", "", "user of node agent")
-	flags.StringVarP(&o.WebPass, "agent-pass", "p", "", "password of node agent")
+	flags.StringVarP(&o.CertOptions.Namespace, "namespace", "e", "", "namespace of vc")
+	flags.StringVarP(&o.CertOptions.Name, "name", "n", "", "name of vc")
+	flags.StringVarP(&o.CertOptions.KubeconfigPath, "kubeconfig", "k", "", "kubeconfig path of host cluster")
+	flags.StringVarP(&o.CertOptions.WebUser, "agent-user", "u", "", "user of node agent")
+	flags.StringVarP(&o.CertOptions.WebPass, "agent-pass", "p", "", "password of node agent")
 	return cmd
 }
 
-func (o *RenewOptions) Complete() (err error) {
+func (o *CertCmdOptions) Complete() (err error) {
 	return nil
 }
 
-func (o *RenewOptions) Validate() error {
-	if len(o.WebPass) == 0 {
+func (o *CertCmdOptions) Validate() error {
+	if len(o.CertOptions.WebPass) == 0 {
 		return fmt.Errorf("web pass is required")
 	}
 
-	if len(o.WebUser) == 0 {
+	if len(o.CertOptions.WebUser) == 0 {
 		return fmt.Errorf("use pass is required")
 	}
-	if len(o.KubeconfigPath) == 0 {
+	if len(o.CertOptions.KubeconfigPath) == 0 {
 		return fmt.Errorf("kubeconfig path is required")
 	}
-	if len(o.Namespace) == 0 {
+	if len(o.CertOptions.Namespace) == 0 {
 		return fmt.Errorf("namespace is required")
 	}
-	if len(o.Name) == 0 {
+	if len(o.CertOptions.Name) == 0 {
 		return fmt.Errorf("name is required")
 	}
 	return nil
 }
 
-func (o *RenewOptions) initEnv() {
-	os.Setenv("KUBECONFIG", o.KubeconfigPath)
-	os.Setenv("WEB_USER", o.WebUser)
-	os.Setenv("WEB_PASS", o.WebPass)
+func (o *CertCmdOptions) initEnv() {
+	os.Setenv("KUBECONFIG", o.CertOptions.KubeconfigPath)
+	os.Setenv("WEB_USER", o.CertOptions.WebUser)
+	os.Setenv("WEB_PASS", o.CertOptions.WebPass)
 }
 
-func (o *RenewOptions) Run() error {
-	r, err := NewCertOption(o)
+func (o *CertCmdOptions) Run() error {
+	r, err := NewCertOption(&o.CertOptions)
 	o.initEnv()
 	if err != nil {
 		return err
 	}
-	return Do(r)
-}
 
-func Do(r *Option) error {
-	err := RunTask([]TaskFunc{
+	err = RunTask([]TaskFunc{
 		RunCheckEnvironment,
 		RunBackupSecrets,
 		RunReCreateCertAndKubeConfig,

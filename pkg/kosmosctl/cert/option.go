@@ -21,6 +21,11 @@ import (
 	"github.com/kosmos.io/kosmos/pkg/scheme"
 )
 
+type NodeAgentOptions struct {
+	WebUser string
+	WebPass string
+}
+
 type Option struct {
 	client.Client
 	remoteClient   clientset.Interface
@@ -28,9 +33,17 @@ type Option struct {
 	virtualCluster *v1alpha1.VirtualCluster
 	dynamicClient  *dynamic.DynamicClient
 	restConfig     *rest.Config
+	tmpValueMap    map[string]interface{}
 }
 
-func NewCertOption(o *RenewOptions) (*Option, error) {
+type CertOptions struct {
+	Namespace      string
+	Name           string
+	KubeconfigPath string
+	NodeAgentOptions
+}
+
+func NewCertOption(o *CertOptions) (*Option, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
 	if err != nil {
 		klog.Infof("Failed to build config: %v\n", err)
@@ -87,6 +100,7 @@ func NewCertOption(o *RenewOptions) (*Option, error) {
 		virtualCluster: &virtualCluster,
 		dynamicClient:  dynamicClient,
 		restConfig:     config,
+		tmpValueMap:    make(map[string]interface{}),
 	}, nil
 }
 
