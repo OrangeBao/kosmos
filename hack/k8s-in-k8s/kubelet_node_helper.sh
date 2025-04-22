@@ -654,16 +654,17 @@ EOL
 
     echo "exec(5/7): update kubelet.conf"
     cp "${PATH_KUBERNETES}/${KUBELET_KUBE_CONFIG_NAME}" "${PATH_KUBERNETES}/${KUBELET_KUBE_CONFIG_NAME}.bak"
-    sed -i "s|server: .*|server: https://apiserver.virtual-cluster-system.svc:${LOCAL_PORT}|" "${PATH_KUBERNETES}/${KUBELET_KUBE_CONFIG_NAME}"
+    sed -i "s|server: .*|server: https://${LOCAL_IP}:${LOCAL_PORT}|" "${PATH_KUBERNETES}/${KUBELET_KUBE_CONFIG_NAME}"
+    sed -i 's|certificate-authority-data: .*|insecure-skip-tls-verify: true|' "${PATH_KUBERNETES}/${KUBELET_KUBE_CONFIG_NAME}"
     
-    echo "exec(6/7): update /etc/hosts"
-    local_record="${LOCAL_IP} apiserver.virtual-cluster-system.svc"
-    if grep -qFx "$local_record" /etc/hosts; then
-        echo "Record $local_record already exists in /etc/hosts."
-    else
-        sed -i "1i $local_record" /etc/hosts
-        echo "Record $local_record inserted into /etc/hosts."
-    fi
+    # echo "exec(6/7): update /etc/hosts"
+    # local_record="${LOCAL_IP} apiserver.virtual-cluster-system.svc"
+    # if grep -qFx "$local_record" /etc/hosts; then
+    #     echo "Record $local_record already exists in /etc/hosts."
+    # else
+    #     sed -i "1i $local_record" /etc/hosts
+    #     echo "Record $local_record inserted into /etc/hosts."
+    # fi
 
     echo "exec(7/7): restart kubelet"
     systemctl restart kubelet
